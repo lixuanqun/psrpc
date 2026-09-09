@@ -46,3 +46,23 @@ func NewNatsMessageBus(nc *nats.Conn, opts ...BusOption) MessageBus {
 func NewRedisMessageBus(rc redis.UniversalClient, opts ...BusOption) MessageBus {
 	return bus.NewRedisMessageBus(rc, opts...)
 }
+
+// ClosableMessageBus is implemented by buses that own network resources
+// (mesh, AMQP, MQTT) and must be closed to release them.
+type ClosableMessageBus interface {
+	MessageBus
+	Close() error
+}
+
+// NewMeshMessageBus creates a brokerless QUIC mesh bus that joins a gossip
+// cluster for peer discovery and subscription propagation. bindAddr is the
+// UDP address to listen on (e.g. "0.0.0.0:0"). seedPeers are the memberlist
+// addresses of at least one existing cluster member (can be empty for the
+// first node). The returned bus must be closed.
+func NewMeshMessageBus(bindAddr string, seedPeers []string, opts ...BusOption) (ClosableMessageBus, error) {
+	b, err := bus.NewMeshMessageBus(bindAddr, seedPeers, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
