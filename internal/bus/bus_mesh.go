@@ -183,6 +183,12 @@ func (b *meshMessageBus) maxDecompressedSize() int {
 	return b.maxSize
 }
 
+// LocalAddr returns the memberlist address of this node, for use as a
+// seed peer by other nodes joining the cluster.
+func (b *meshMessageBus) LocalAddr() string {
+	return b.list.LocalNode().Address()
+}
+
 // ---- memberlist.Delegate ----
 
 func (b *meshMessageBus) NodeMeta(limit int) []byte {
@@ -344,7 +350,7 @@ func (b *meshMessageBus) handleIncoming(conn *quic.Conn) {
 		if err != nil {
 			return
 		}
-		go b.handleStream(stream)
+		go b.readFrames(stream)
 	}
 }
 
@@ -574,39 +580,46 @@ func (b *meshMessageBus) Close() error {
 	return nil
 }
 
-// ---- incoming stream handler ----
-
-// wireFrame: 2 bytes topic length + topic + 4 bytes payload length + payload.
-func (b *meshMessageBus) handleStream(stream *quic.Stream) {
+// readFrames reads framed messages from one QUIC stream until closed.
+// Each frame: 4 bytes big-endian length + payload. The payload is itself
+// a wire frame: 2 bytes topic length + topic + 4 bytes payload len + payload.
+func (b *meshMessageBus) readFrames(stream *quic.Stream) {
 	defer stream.Close()
-	var topicLen [2]byte
-	if _, err := io.ReadFull(stream, topicLen[:]); err != nil {
-		return
-	}
-	tLen := binary.BigEndian.Uint16(topicLen[:])
-	topic := make([]byte, tLen)
-	if _, err := io.ReadFull(stream, topic); err != nil {
-		return
-	}
-	var payloadLen [4]byte
-	if _, err := io.ReadFull(stream, payloadLen[:]); err != nil {
-		return
-	}
-	pLen := binary.BigEndian.Uint32(payloadLen[:])
-	payload := make([]byte, pLen)
-	if _, err := io.ReadFull(stream, payload); err != nil {
-		return
-	}
-
-	b.mu.Lock()
-	subList := b.subs[string(topic)]
-	queueList := b.queues[string(topic)]
-	b.mu.Unlock()
-	if subList != nil {
-		subList.dispatch(payload)
-	}
-	if queueList != nil {
-		queueList.dispatchQueue(payload)
+	for {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+			return
+		}
+		frameLen := binary.BigEndian.Uint32(lenBuf[:])
+		frame := make([]byte, frameLen)
+		if _, err := io.ReadFull(stream, frame); err != nil {
+			return
+		}
+		if len(frame) < 2 {
+			return
+		}
+		tLen := binary.BigEndian.Uint16(frame[0:])
+		if len(frame) < 2+int(tLen)+4 {
+			return
+		}
+		topic := string(frame[2 : 2+tLen])
+		off := 2 + int(tLen)
+		pLen := binary.BigEndian.Uint32(frame[off:])
+		off += 4
+		if len(frame) < off+int(pLen) {
+			return
+		}
+		payload := frame[off : off+int(pLen)]
+		b.mu.Lock()
+		subList := b.subs[topic]
+		queueList := b.queues[topic]
+		b.mu.Unlock()
+		if subList != nil {
+			subList.dispatch(payload)
+		}
+		if queueList != nil {
+			queueList.dispatchQueue(payload)
+		}
 	}
 }
 
@@ -615,19 +628,24 @@ func (b *meshMessageBus) handleStream(stream *quic.Stream) {
 type meshPeer struct {
 	addr string
 
-	mu     sync.Mutex
-	conn   *quic.Conn
+	mu    sync.Mutex
+	conn  *quic.Conn
+	str   *quic.Stream // persistent outgoing stream
+	strMu sync.Mutex   // serialises writes to str
 	closed bool
 }
 
 func (p *meshPeer) setConn(conn *quic.Conn) {
+	p.strMu.Lock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.conn != nil {
 		_ = p.conn.CloseWithError(0, "replaced")
 	}
 	p.conn = conn
+	p.str = nil
 	p.closed = false
+	p.mu.Unlock()
+	p.strMu.Unlock()
 }
 
 func (p *meshPeer) isLive() bool {
@@ -637,30 +655,61 @@ func (p *meshPeer) isLive() bool {
 }
 
 func (p *meshPeer) send(frame []byte) error {
+	p.strMu.Lock()
+	defer p.strMu.Unlock()
+
 	p.mu.Lock()
+	str := p.str
 	conn := p.conn
 	p.mu.Unlock()
+
 	if conn == nil {
 		return errors.New("no connection")
 	}
-	stream, err := conn.OpenStream()
-	if err != nil {
+
+	if str == nil {
+		// Open a persistent outgoing stream. Frame delimiter: 4-byte
+		// big-endian length prefix. The receiver reads 4 bytes, then
+		// length bytes, in a loop.
+		s, err := conn.OpenStream()
+		if err != nil {
+			return err
+		}
+		p.mu.Lock()
+		p.str = s
+		p.mu.Unlock()
+		str = s
+	}
+
+	// Frame prefix: 4 bytes length + payload.
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(frame)))
+	if _, err := (*str).Write(hdr[:]); err != nil {
+		p.mu.Lock()
+		p.str = nil
+		p.mu.Unlock()
 		return err
 	}
-	_, err = stream.Write(frame)
+	_, err := (*str).Write(frame)
 	if err != nil {
-		_ = stream.Close()
-		return err
+		p.mu.Lock()
+		p.str = nil
+		p.mu.Unlock()
 	}
-	return stream.Close()
+	return err
 }
 
 func (p *meshPeer) close() error {
+	p.strMu.Lock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.closed = true
-	if p.conn != nil {
-		return p.conn.CloseWithError(0, "closing")
+	conn := p.conn
+	p.conn = nil
+	p.str = nil
+	p.mu.Unlock()
+	p.strMu.Unlock()
+	if conn != nil {
+		return conn.CloseWithError(0, "closing")
 	}
 	return nil
 }
