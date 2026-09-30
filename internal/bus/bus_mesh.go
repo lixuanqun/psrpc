@@ -29,8 +29,9 @@
 //   - Queue topics use round-robin among local subscribers only; cross-node
 //     queue semantics are not yet implemented (claim-based coordination on
 //     the roadmap).
-//   - QUIC connections are established lazily per peer pair; each message
-//     opens a new stream (prototype simplification).
+//   - QUIC connections are established lazily per peer pair; each pair
+//     shares one persistent stream, with length-prefixed frames multiplexed
+//     on it.
 //
 // Known gaps (prototype):
 //   - No graceful leave / subscription drain,
@@ -66,6 +67,10 @@ const (
 	meshPushPullInterval = 30 * time.Second
 	meshQUICKeepAlive    = 15 * time.Second
 	meshDialTimeout      = 3 * time.Second
+
+	// meshMaxFrameLen caps the length-prefixed frame size on the wire so a
+	// corrupted or hostile length cannot trigger an unbounded allocation.
+	meshMaxFrameLen = 16 << 20
 )
 
 var errMeshClosed = errors.New("psrpc: mesh message bus closed")
@@ -174,8 +179,6 @@ func NewMeshMessageBus(bindAddr string, seedPeers []string, opts ...BusOption) (
 		}
 	}
 
-	go b.acceptLoop()
-	go b.gossipEventLoop()
 	return b, nil
 }
 
@@ -205,7 +208,7 @@ func (b *meshMessageBus) NodeMeta(limit int) []byte {
 			return false
 		}
 		buf = append(buf, flags)
-		binary.BigEndian.AppendUint16(buf, uint16(len(topic)))
+		buf = binary.BigEndian.AppendUint16(buf, uint16(len(topic)))
 		buf = append(buf, topic...)
 		return true
 	}
@@ -281,7 +284,6 @@ func (b *meshMessageBus) gossipEventLoop() {
 				// sent during subscribe, but the peer may not have
 				// been in the cluster yet.
 				b.broadcastSubs()
-				b.updateRemote(evt.Node.Name, evt.Node.Meta)
 				b.updateRemote(evt.Node.Name, evt.Node.Meta)
 			case memberlist.NodeLeave:
 				b.removePeerLocked(evt.Node.Name)
@@ -591,6 +593,9 @@ func (b *meshMessageBus) readFrames(stream *quic.Stream) {
 			return
 		}
 		frameLen := binary.BigEndian.Uint32(lenBuf[:])
+		if frameLen > meshMaxFrameLen {
+			return
+		}
 		frame := make([]byte, frameLen)
 		if _, err := io.ReadFull(stream, frame); err != nil {
 			return
@@ -681,22 +686,19 @@ func (p *meshPeer) send(frame []byte) error {
 		str = s
 	}
 
-	// Frame prefix: 4 bytes length + payload.
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(frame)))
-	if _, err := (*str).Write(hdr[:]); err != nil {
+	// Frame prefix: 4 bytes length + payload, assembled and written in a
+	// single Write so a partial failure cannot desynchronize the stream
+	// framing for subsequent frames.
+	buf := make([]byte, 4+len(frame))
+	binary.BigEndian.PutUint32(buf, uint32(len(frame)))
+	copy(buf[4:], frame)
+	if _, err := (*str).Write(buf); err != nil {
 		p.mu.Lock()
 		p.str = nil
 		p.mu.Unlock()
 		return err
 	}
-	_, err := (*str).Write(frame)
-	if err != nil {
-		p.mu.Lock()
-		p.str = nil
-		p.mu.Unlock()
-	}
-	return err
+	return nil
 }
 
 func (p *meshPeer) close() error {
