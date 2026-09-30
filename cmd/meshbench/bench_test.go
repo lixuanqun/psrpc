@@ -148,3 +148,93 @@ func percentiles(ds []time.Duration) (p50, p95, p99, max time.Duration) {
 	p := func(q float64) time.Duration { return s[int(float64(len(s)-1)*q)] }
 	return p(0.50), p(0.95), p(0.99), s[len(s)-1]
 }
+// TestBenchMeshQueue measures bus-level queue publish throughput over a
+// three-node mesh cluster, mirroring the cross-bus methodology from #128:
+// competing consumers (SubscribeQueue) on every node, publishing from one
+// node. Queue topics are spread over 30 topics, since queue ownership is
+// elected per topic (highest-random-weight hash) and a single topic would
+// pin all traffic to one owner.
+//
+// Run: go test ./cmd/meshbench/ -run TestBenchMeshQueue -v -count=1
+func TestBenchMeshQueue(t *testing.T) {
+	const numTopics = 30 // within the subscription broadcast size cap
+
+	seed, err := bus.NewMeshMessageBus("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seed.Close()
+	n1, err := bus.NewMeshMessageBus("127.0.0.1:0", []string{seed.LocalAddr()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n1.Close()
+	n2, err := bus.NewMeshMessageBus("127.0.0.1:0", []string{seed.LocalAddr()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+
+	channels := make([]bus.Channel, numTopics)
+	for i := range channels {
+		channels[i] = bus.Channel{Legacy: fmt.Sprintf("livekit|benchq%d|%s|REQ", i, rand.NewString())}
+	}
+
+	ctx := context.Background()
+	var received atomic.Int64
+	var subsWG sync.WaitGroup
+	for _, node := range []bus.MessageBus{seed, n1, n2} {
+		for _, ch := range channels {
+			sub, err := bus.SubscribeQueue[*internal.Request](ctx, node, ch, bus.DefaultChannelSize*64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			subsWG.Add(1)
+			go func() {
+				defer subsWG.Done()
+				for range sub.Channel() {
+					received.Add(1)
+				}
+			}()
+		}
+	}
+
+	// Let gossip and the subscription broadcasts settle.
+	time.Sleep(2 * time.Second)
+
+	for _, w := range []int{1, 8, 32, 128} {
+		before := received.Load()
+		var sent atomic.Int64
+		deadline := time.Now().Add(benchDuration)
+		var wg sync.WaitGroup
+		for i := 0; i < w; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				n := 0
+				for time.Now().Before(deadline) {
+					ch := channels[(i+n)%numTopics]
+					if err := seed.Publish(ctx, ch, &internal.Request{RequestId: rand.NewRequestID()}); err != nil {
+						t.Error(err)
+						return
+					}
+					sent.Add(1)
+					n++
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		// Bounded wait for delivery to catch up.
+		catchup := time.Now().Add(5 * time.Second)
+		for received.Load()-before < sent.Load() && time.Now().Before(catchup) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		got := received.Load() - before
+		if got != sent.Load() {
+			t.Fatalf("w=%d: queue delivery mismatch: sent=%d received=%d (exactly-once violated)", w, sent.Load(), got)
+		}
+		qps := float64(got) / benchDuration.Seconds()
+		fmt.Fprintf(os.Stderr, "[mesh-queue] w=%-4d n=%d qps=%d\n", w, got, int(qps))
+	}
+}

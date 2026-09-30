@@ -26,17 +26,25 @@
 //   - Publish forwards to every peer that has remote subscribers for the
 //     topic, plus local delivery. The wire frame carries the topic name so
 //     the receiver can route to the correct local subscriber list.
-//   - Queue topics use round-robin among local subscribers only; cross-node
-//     queue semantics are not yet implemented (claim-based coordination on
-//     the roadmap).
+//   - Queue topics elect a single owner node per topic via
+//     highest-random-weight hashing over the nodes with local queue
+//     subscribers; publishers forward queue messages to the owner only,
+//     which delivers to one of its local subscribers (round-robin). This
+//     gives bus-level single delivery cluster-wide, keeping queue RPCs
+//     correct even when the claim is skipped. Publishers may briefly
+//     disagree on the owner while subscription changes propagate; psrpc
+//     absorbs that window the same way it absorbs Redis's dedup window
+//     (request expiry + caller retry).
 //   - QUIC connections are established lazily per peer pair; each pair
 //     shares one persistent stream, with length-prefixed frames multiplexed
 //     on it.
 //
 // Known gaps (prototype):
-//   - No graceful leave / subscription drain,
-//   - Queue topics are local-only (no cross-node competing consumers),
-//   - NodeMeta caps subscription sets at 512 bytes,
+//   - No graceful leave / subscription drain; queue ownership is not
+//     handed over, so in-flight messages to a departed owner are dropped
+//     (at-most-once),
+//   - NodeMeta caps subscription sets at 512 bytes and the reliable
+//     subscription broadcast at 1400 bytes,
 //   - Self-signed TLS with InsecureSkipVerify (suitable for loopback testing).
 package bus
 
@@ -50,6 +58,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/big"
 	"net"
@@ -157,7 +166,15 @@ func NewMeshMessageBus(bindAddr string, seedPeers []string, opts ...BusOption) (
 	mlConf.Delegate = b
 	mlConf.Events = &memberlist.ChannelEventDelegate{Ch: eventCh}
 
-	list, err := memberlist.Create(mlConf)
+	// A dynamic bind port can land in an OS-excluded port range (seen on
+	// Windows dev machines); retry before giving up.
+	var list *memberlist.Memberlist
+	for range 3 {
+		list, err = memberlist.Create(mlConf)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		_ = quicLn.Close()
 		_ = udpConn.Close()
@@ -408,6 +425,10 @@ func (b *meshMessageBus) Publish(_ context.Context, channel Channel, msg proto.M
 	}
 	subList := b.subs[topic]
 	queueList := b.queues[topic]
+	// Elect the queue owner under the same lock that guards the
+	// subscription views, so the owner matches the snapshot used for
+	// the rest of the publish.
+	queueOwner := meshQueueOwner(topic, b.selfAddr, queueList != nil, b.remoteQ)
 	b.mu.Unlock()
 
 	if closed {
@@ -418,8 +439,18 @@ func (b *meshMessageBus) Publish(_ context.Context, channel Channel, msg proto.M
 	if subList != nil {
 		subList.dispatch(payload)
 	}
-	if queueList != nil {
+
+	// Queue delivery: exactly one node cluster-wide dispatches the
+	// message. When this node owns the topic, round-robin locally;
+	// otherwise forward a single frame to the owner, whose readFrames
+	// dispatches to its own local queue subscribers.
+	switch {
+	case queueOwner == "":
+		// No node has a queue subscriber for the topic; drop (at-most-once).
+	case queueOwner == b.selfAddr:
 		queueList.dispatchQueue(payload)
+	default:
+		targets = append(targets, queueOwner)
 	}
 
 	// Remote delivery.
@@ -535,6 +566,36 @@ func (b *meshMessageBus) broadcastSubs() {
 			b.list.SendReliable(m, buf)
 		}
 	}
+}
+
+// meshQueueOwner elects the owner node for a queue topic using
+// highest-random-weight (Rendezvous) hashing over the candidate set: the
+// local node (only when selfCand is set) plus every node known to have
+// local queue subscribers for the topic. All publishers derive the same
+// owner from the same subscription view, so each queue message is
+// dispatched by exactly one node cluster-wide. The hash is stable for a
+// given (node, topic) pair, so ownership only changes when the set of
+// subscribing nodes changes.
+func meshQueueOwner(topic, selfAddr string, selfCand bool, remoteQ map[string]map[string]struct{}) string {
+	owner := ""
+	var best uint64
+	consider := func(node string) {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(node))
+		_, _ = h.Write([]byte(topic))
+		if s := h.Sum64(); s > best {
+			owner, best = node, s
+		}
+	}
+	if selfCand {
+		consider(selfAddr)
+	}
+	for addr, topics := range remoteQ {
+		if _, ok := topics[topic]; ok {
+			consider(addr)
+		}
+	}
+	return owner
 }
 
 func (b *meshMessageBus) unsubscribe(topic string, queue bool, sub *meshSubscription) {
